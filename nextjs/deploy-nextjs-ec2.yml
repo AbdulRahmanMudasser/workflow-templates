@@ -1,0 +1,192 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types:
+      - closed
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' || 
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.ref }}
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Verify server connection and setup directories
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             mkdir -p .next/standalone && \
+             echo 'Directory structure ready for GitHub Actions' && \
+             ls -la .next/ || echo 'Directory created'"
+
+      - name: Stop PM2 process gracefully
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             pm2 stop <PM2_APP_NAME> 2>/dev/null || true && \
+             pm2 delete <PM2_APP_NAME> 2>/dev/null || true"
+
+      - name: Clean up old build files on server
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             rm -rf .next && \
+             mkdir -p .next/standalone && \
+             echo 'Old build files cleared, directory structure ready'"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Clean local build artifacts
+        run: rm -rf .next
+
+      - name: Build Next.js application
+        id: build
+        run: |
+          npm run build || {
+            echo "Build failed, cleaning up..."
+            rm -rf .next node_modules/.cache
+            exit 1
+          }
+        env:
+          NODE_ENV: production
+          # Add your environment variables here
+          # NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+      - name: Verify build output
+        if: steps.build.outcome == 'success'
+        run: |
+          if [ ! -d ".next/standalone" ] || [ ! -d ".next/static" ] || [ ! -f ".next/BUILD_ID" ]; then
+            echo "Error: Build output incomplete"
+            exit 1
+          fi
+
+      - name: Verify standalone structure
+        if: steps.build.outcome == 'success'
+        run: |
+          if [ ! -d ".next/standalone/.next" ]; then
+            echo "Error: .next directory not found inside standalone build"
+            ls -la .next/standalone/ || true
+            exit 1
+          fi
+
+      - name: Upload standalone build files
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "mkdir -p /var/www/<PROJECT_NAME>/.next/standalone && chmod -R 755 /var/www/<PROJECT_NAME>/.next/standalone"
+          rsync -avz --progress --delete -e "ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no" \
+            .next/standalone/ ubuntu@${{ secrets.EC2_HOST }}:/var/www/<PROJECT_NAME>/.next/standalone/ || {
+            echo "Standalone upload failed, cleaning up server..."
+            ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+              "cd /var/www/<PROJECT_NAME> && rm -rf .next/standalone/*"
+            exit 1
+          }
+
+      - name: Upload static assets and build metadata
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "mkdir -p /var/www/<PROJECT_NAME>/.next/static"
+          rsync -avz --progress -e "ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no" \
+            .next/static/ ubuntu@${{ secrets.EC2_HOST }}:/var/www/<PROJECT_NAME>/.next/static/
+          scp -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no .next/BUILD_ID \
+            ubuntu@${{ secrets.EC2_HOST }}:/var/www/<PROJECT_NAME>/.next/BUILD_ID
+
+      - name: Upload source files
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             rm -rf app lib components 2>/dev/null || true && \
+             mkdir -p app lib components"
+          for dir in app lib components; do
+            if [ -d "$dir" ]; then
+              rsync -avz --progress -e "ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no" \
+                $dir/ ubuntu@${{ secrets.EC2_HOST }}:/var/www/<PROJECT_NAME>/$dir/ || true
+            fi
+          done
+
+      - name: Upload ecosystem config
+        if: steps.build.outcome == 'success'
+        run: |
+          scp -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ecosystem.config.js \
+            ubuntu@${{ secrets.EC2_HOST }}:/var/www/<PROJECT_NAME>/ecosystem.config.js
+
+      - name: Setup standalone build structure
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             cp .env.local .next/standalone/.env.local 2>/dev/null || echo 'Warning: .env.local not found' && \
+             if [ ! -d .next/standalone/.next ]; then \
+               echo 'Error: .next directory not found in standalone build'; \
+               exit 1; \
+             fi && \
+             if [ -d .next/static ] && [ ! -d .next/standalone/.next/static ]; then \
+               ln -sf ../../static .next/standalone/.next/static 2>/dev/null || cp -r .next/static .next/standalone/.next/static; \
+             fi && \
+             if [ -f .next/BUILD_ID ] && [ ! -f .next/standalone/.next/BUILD_ID ]; then \
+               cp .next/BUILD_ID .next/standalone/.next/BUILD_ID; \
+             fi"
+
+      - name: Restart PM2 process
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             pm2 delete <PM2_APP_NAME> 2>/dev/null || true && \
+             pm2 start ecosystem.config.js && \
+             pm2 save || echo 'PM2 save failed (non-critical)'"
+
+      - name: Verify deployment
+        if: steps.build.outcome == 'success'
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "pm2 status && \
+             sleep 3 && \
+             APP_STATUS=\$(pm2 jlist | grep -o '\"status\":\"[^\"]*\"' | head -1 | cut -d'\"' -f4) && \
+             if [ \"\$APP_STATUS\" != \"online\" ]; then \
+               echo 'Warning: Application status is not online'; \
+               pm2 logs <PM2_APP_NAME> --err --lines 30 --nostream; \
+             fi && \
+             pm2 logs <PM2_APP_NAME> --lines 20 --nostream | tail -10 || echo 'Logs not available yet'"
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} \
+            "cd /var/www/<PROJECT_NAME> && \
+             pm2 stop <PM2_APP_NAME> 2>/dev/null || true && \
+             pm2 delete <PM2_APP_NAME> 2>/dev/null || true && \
+             rm -rf .next/standalone/* 2>/dev/null || true"
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/ec2_key.pem
+
